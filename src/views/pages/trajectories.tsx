@@ -15,17 +15,23 @@ export function NewTrajectoryPage({
   models,
   selectedRepoId,
   selectedModelIds,
+  defaultRepoId,
+  defaultModelIds,
   error,
 }: {
   repos: Repo[];
   models: Model[];
   selectedRepoId?: string;
   selectedModelIds?: string[];
+  defaultRepoId?: string;
+  defaultModelIds?: string[];
   error?: string;
 }) {
-  const firstModel = models[0];
-  const checkedModelIds =
-    selectedModelIds ?? (firstModel ? [firstModel.id] : []);
+  const checkedModelIds = selectedModelIds ?? defaultModelIds ?? [];
+  const selected =
+    selectedRepoId ??
+    defaultRepoId ??
+    (repos.length === 0 ? undefined : repos[0]?.id);
   return (
     <Layout title="New trajectory" section="trajectories">
       <div class="page-intro">
@@ -54,7 +60,7 @@ export function NewTrajectoryPage({
         <form class="card stack form-card" method="post" action="/trajectories">
           <select name="repoId" required aria-label="Repository">
             {repos.map((repo) => (
-              <option value={repo.id} selected={repo.id === selectedRepoId}>
+              <option value={repo.id} selected={repo.id === selected}>
                 {repo.owner}/{repo.name}
               </option>
             ))}
@@ -183,39 +189,62 @@ export function TrajectoryDetailPage({
 }
 
 function TurnCard({ turn, events }: TurnTranscript) {
-  const output = events
-    .filter((event) => event.kind === "model_output")
-    .map((event) => event.data)
-    .join("\n\n");
-  const details = events.filter((event) => event.kind !== "model_output");
+  const groups = groupTurnEvents(events);
   return (
     <article class="card">
       <p class="turn-prompt">{turn.prompt}</p>
-      {output ? (
-        <div
-          class="model-output"
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(output) }}
-        />
-      ) : (
-        <p class="model-output empty-output">No output yet.</p>
-      )}
-      {details.length > 0 && (
-        <details class="turn-details">
-          <summary>
-            {details.length} {details.length === 1 ? "event" : "events"}
-          </summary>
-          <pre class="log">
-            {details
-              .map(
-                (event) =>
-                  `${event.ts.toLocaleTimeString("en-GB")}  [${event.kind}] ${event.data}`,
-              )
-              .join("\n")}
-          </pre>
-        </details>
-      )}
+      {groups.map(({ output, details }, index) => (
+        <>
+          {output ? (
+            <div
+              class="model-output"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(output) }}
+            />
+          ) : (
+            <p class="model-output empty-output">No output yet.</p>
+          )}
+          {details.length > 0 && (
+            <details
+              class="turn-details"
+              data-refresh-key={`${turn.id}:${index.toString()}`}
+            >
+              <summary>
+                {details.length} {details.length === 1 ? "event" : "events"}
+              </summary>
+              <pre class="log">
+                {details
+                  .map(
+                    (event) =>
+                      `${event.ts.toLocaleTimeString("en-GB")}  [${event.kind}] ${event.data}`,
+                  )
+                  .join("\n")}
+              </pre>
+            </details>
+          )}
+        </>
+      ))}
     </article>
   );
+}
+
+function groupTurnEvents(events: RunEvent[]) {
+  const groups: Array<{ output?: string; details: RunEvent[] }> = [];
+  const leadingDetails: RunEvent[] = [];
+
+  for (const event of events) {
+    if (event.kind === "model_output") {
+      groups.push({
+        output: event.data,
+        details: groups.length === 0 ? leadingDetails : [],
+      });
+      continue;
+    }
+
+    const current = groups.at(-1);
+    (current?.details ?? leadingDetails).push(event);
+  }
+
+  return groups.length > 0 ? groups : [{ details: leadingDetails }];
 }
 
 export function TrajectoriesPage({

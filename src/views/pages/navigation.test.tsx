@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Trajectory, TrajectoryStatus, Turn } from "../../store/types";
+import type {
+  RunEvent,
+  Trajectory,
+  TrajectoryStatus,
+  Turn,
+} from "../../store/types";
 import { createStarterModels, createStarterRepos } from "../../store/seed";
 import { renderPage } from "../render";
 import { trajectoryDisplayStatus } from "../components";
@@ -13,7 +18,9 @@ import {
   TrajectoriesPage,
 } from "./trajectories";
 import { ComparisonPage, type ComparisonColumn } from "./comparisons";
+import { ContainersPage } from "./containers";
 import { SpendPage } from "./spend";
+import { SettingsPage } from "./settings";
 
 const repos = createStarterRepos(new Date("2026-09-06T12:00:00Z").getTime());
 const models = createStarterModels(new Date("2026-09-06T12:00:00Z").getTime());
@@ -54,11 +61,55 @@ void test("renders the primary navigation", () => {
   );
 
   assert.match(html, /🛠️/u);
-  assert.match(html, /href="\/repos"/);
   assert.match(html, /href="\/trajectories"/);
-  assert.match(html, /href="\/models"/);
   assert.match(html, /href="\/spend"/);
+  assert.match(html, /href="\/settings"/);
+  assert.doesNotMatch(html, /href="\/(?:repos|containers|models)"/);
   assert.equal(html.match(/href="\/trajectories\/new"/g)?.length, 1);
+});
+
+void test("links resource settings from the settings page", () => {
+  const html = renderPage(<SettingsPage />);
+
+  assert.match(html, /aria-current="page">Settings<\/a>/);
+  for (const resource of ["repos", "containers", "models"])
+    assert.match(html, new RegExp(`href="/${resource}"`));
+});
+
+void test("lists managed containers with bulk removal actions", () => {
+  const html = renderPage(
+    <ContainersPage
+      containers={[
+        {
+          id: "container-active-123456789",
+          name: "llm-garage-trajectory-trajectory-active",
+          trajectoryId: "trajectory-active",
+          image: "alpine:3.22.5",
+          state: "running",
+          status: "Up 2 minutes",
+          createdAt: new Date("2026-09-06T12:00:00Z"),
+        },
+        {
+          id: "container-idle-123456789",
+          name: "llm-garage-trajectory-trajectory-idle",
+          trajectoryId: "trajectory-idle",
+          image: "alpine:3.22.5",
+          state: "running",
+          status: "Up 10 minutes",
+          createdAt: new Date("2026-09-06T11:52:00Z"),
+        },
+      ]}
+      trajectories={trajectories}
+    />,
+  );
+
+  assert.match(html, /aria-current="page">Settings<\/a>/);
+  assert.match(html, /action="\/containers\/remove-idle"/);
+  assert.match(html, /action="\/containers\/remove-all"/);
+  assert.match(html, /status-active">active<\/span>/);
+  assert.match(html, /status-idle">idle<\/span>/);
+  assert.match(html, /href="\/trajectories\/trajectory-active"/);
+  assert.match(html, /alpine:3\.22\.5/);
 });
 
 void test("loads page styles from the shared stylesheet", () => {
@@ -67,6 +118,24 @@ void test("loads page styles from the shared stylesheet", () => {
   );
 
   assert.match(html, /<link rel="stylesheet" href="\/styles\.css"\/>/);
+  assert.doesNotMatch(html, /refresh\.js/);
+});
+
+void test("renders active trajectory content before enabling live updates", () => {
+  const trajectory = trajectories.find(({ id }) => id === "trajectory-active");
+  assert.ok(trajectory);
+  const html = renderPage(
+    <TrajectoryDetailPage
+      trajectory={trajectory}
+      transcript={[{ turn: turnFor(trajectory), events: [] }]}
+    />,
+  );
+
+  assert.match(html, /<main data-refresh-seconds="1">/);
+  assert.match(html, /<script src="\/refresh\.js" defer><\/script>/);
+  assert.match(html, /status-active">active<\/span>/);
+  assert.match(html, /No output yet\./);
+  assert.doesNotMatch(html, /http-equiv="refresh"/);
 });
 
 void test("renders repository links and trajectory counts", () => {
@@ -104,6 +173,24 @@ void test("lists each model with its provider and effort", () => {
   }
   assert.match(html, /<td>medium<\/td>/);
   assert.match(html, /href="\/models\/new"/);
+});
+
+void test("lists models sorted alphabetically by name", () => {
+  const shuffled = [
+    ...models.filter(({ id }) => id === "z-ai/glm-5.2"),
+    ...models.filter(({ id }) => id === "openai/gpt-5.6-sol"),
+    ...models.filter(({ id }) => id === "moonshotai/kimi-k3"),
+    ...models.filter(({ id }) => id === "anthropic/claude-opus-5"),
+  ];
+  const html = renderPage(
+    <ModelsPage models={shuffled} trajectories={trajectories} />,
+  );
+
+  const names = models
+    .map((model) => model.name)
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  const indices = names.map((name) => html.indexOf(name));
+  assert.deepEqual(indices, [...indices].sort((a, b) => a - b));
 });
 
 void test("offers every OpenRouter effort level when adding a model", () => {
@@ -343,7 +430,7 @@ void test("maps internal trajectory states to user-facing states", () => {
   }
 });
 
-void test("identifies each trajectory's model and OpenRouter gateway", () => {
+void test("identifies each trajectory's model", () => {
   const html = renderPage(
     <TrajectoriesPage
       repos={repos}
@@ -352,10 +439,10 @@ void test("identifies each trajectory's model and OpenRouter gateway", () => {
     />,
   );
 
-  assert.match(html, /GPT-5\.6 Sol via OpenRouter/);
-  assert.match(html, /Claude Opus 5 via OpenRouter/);
-  assert.match(html, /Kimi K3 via OpenRouter/);
-  assert.match(html, /GLM 5\.2 via OpenRouter/);
+  assert.match(html, /GPT-5\.6 Sol/);
+  assert.match(html, /Claude Opus 5/);
+  assert.match(html, /Kimi K3/);
+  assert.match(html, /GLM 5\.2/);
 });
 
 void test("shows model output outside the collapsed turn details", () => {
@@ -399,7 +486,67 @@ void test("shows model output outside the collapsed turn details", () => {
   assert.match(beforeDetails, /The capital of France is Paris\./);
   assert.doesNotMatch(beforeDetails, /Trajectory finished/);
   assert.match(html, /<summary>1 event<\/summary>/);
+  assert.match(html, new RegExp(`data-refresh-key="${turn.id}:0"`));
   assert.doesNotMatch(html, /<details[^>]*open/);
+});
+
+void test("shows event details below the model output they follow", () => {
+  const trajectory = trajectories.find(({ id }) => id === "trajectory-idle");
+  assert.ok(trajectory);
+  const turn = turnFor(trajectory);
+  const ts = new Date("2026-01-01T09:30:00Z");
+  const html = renderPage(
+    <TrajectoryDetailPage
+      trajectory={trajectory}
+      transcript={[
+        {
+          turn,
+          events: [
+            runEvent(
+              turn,
+              "first-output",
+              1,
+              "model_output",
+              "First response",
+              ts,
+            ),
+            runEvent(turn, "first-tool", 2, "tool", "Inspected files", ts),
+            runEvent(
+              turn,
+              "second-output",
+              3,
+              "model_output",
+              "Second response",
+              ts,
+            ),
+            runEvent(turn, "second-tool", 4, "tool", "Ran tests", ts),
+            runEvent(
+              turn,
+              "final-output",
+              5,
+              "model_output",
+              "Final response",
+              ts,
+            ),
+          ],
+        },
+      ]}
+    />,
+  );
+
+  const firstOutput = html.indexOf("First response");
+  const firstDetails = html.indexOf("<details", firstOutput);
+  const secondOutput = html.indexOf("Second response");
+  const secondDetails = html.indexOf("<details", secondOutput);
+  const finalOutput = html.indexOf("Final response");
+
+  assert.ok(firstOutput < firstDetails);
+  assert.ok(firstDetails < secondOutput);
+  assert.ok(secondOutput < secondDetails);
+  assert.ok(secondDetails < finalOutput);
+  assert.match(html.slice(firstDetails, secondOutput), /Inspected files/);
+  assert.doesNotMatch(html.slice(firstDetails, secondOutput), /Ran tests/);
+  assert.match(html.slice(secondDetails, finalOutput), /Ran tests/);
 });
 
 void test("renders model output as markdown without raw HTML", () => {
@@ -459,6 +606,25 @@ void test("shows each compared model's output side by side", () => {
   assert.match(html, /Opus answered/);
   assert.match(html, /href="\/trajectories\/compare-sol"/);
   assert.match(html, /href="\/trajectories\/compare-opus"/);
+});
+
+void test("live updates an active comparison after rendering every column", () => {
+  const [repo] = repos;
+  assert.ok(repo);
+  const active = comparisonColumn(
+    "compare-active",
+    "openai/gpt-5.6-sol",
+    "Partial answer",
+  );
+  active.trajectory.status = "running";
+  const html = renderPage(
+    <ComparisonPage repo={repo} models={models} columns={[active]} />,
+  );
+
+  assert.match(html, /<main data-refresh-seconds="1">/);
+  assert.match(html, /Partial answer/);
+  assert.match(html, /<script src="\/refresh\.js" defer><\/script>/);
+  assert.doesNotMatch(html, /http-equiv="refresh"/);
 });
 
 void test("links a compared trajectory back to its comparison", () => {
@@ -544,5 +710,24 @@ function turnFor(trajectory: Trajectory): Turn {
     status: "succeeded",
     createdAt: trajectory.createdAt,
     finishedAt: trajectory.updatedAt,
+  };
+}
+
+function runEvent(
+  turn: Turn,
+  id: string,
+  sequence: number,
+  kind: RunEvent["kind"],
+  data: string,
+  ts: Date,
+): RunEvent {
+  return {
+    id,
+    trajectoryId: turn.trajectoryId,
+    turnId: turn.id,
+    sequence,
+    kind,
+    data,
+    ts,
   };
 }

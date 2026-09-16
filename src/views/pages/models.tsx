@@ -17,8 +17,11 @@ export function ModelsPage({
   notice?: string;
 }) {
   const success = notice?.startsWith("Added") || notice?.startsWith("Deleted");
+  const sortedModels = [...models].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+  );
   return (
-    <Layout title="Models" section="models">
+    <Layout title="Models" section="settings">
       <div class="page-header">
         <h1>Models</h1>
         <a class="button button-primary" href="/models/new">
@@ -45,7 +48,7 @@ export function ModelsPage({
               </tr>
             </thead>
             <tbody>
-              {models.map((model) => (
+              {sortedModels.map((model) => (
                 <tr>
                   <td>
                     <a
@@ -83,7 +86,7 @@ export function NewModelPage({
   error?: string;
 }) {
   return (
-    <Layout title="Add model" section="models">
+    <Layout title="Add model" section="settings">
       <div class="breadcrumb">
         <a href="/models">Models</a>
         <span>/</span>
@@ -136,7 +139,7 @@ export function ModelDetailPage({
 }) {
   const path = `/models/${encodeURIComponent(model.id)}`;
   return (
-    <Layout title={model.name} section="models">
+    <Layout title={model.name} section="settings">
       <div class="breadcrumb">
         <a href="/models">Models</a>
         <span>/</span>

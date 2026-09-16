@@ -1,16 +1,15 @@
 import type { ComponentChildren } from "preact";
 
-export type NavigationSection = "models" | "repos" | "trajectories" | "spend";
+export type NavigationSection = "settings" | "trajectories" | "spend";
 
 const navItems: Array<{
   href: string;
   label: string;
   section: NavigationSection;
 }> = [
-  { href: "/repos", label: "Repositories", section: "repos" },
   { href: "/trajectories", label: "Trajectories", section: "trajectories" },
-  { href: "/models", label: "Models", section: "models" },
   { href: "/spend", label: "Spend", section: "spend" },
+  { href: "/settings", label: "Settings", section: "settings" },
 ];
 
 export function Layout({
@@ -30,13 +29,11 @@ export function Layout({
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="color-scheme" content="dark" />
-        {refreshSeconds && (
-          <meta http-equiv="refresh" content={String(refreshSeconds)} />
-        )}
         <title>
           {title === "LLM Garage" ? title : `${title} · LLM Garage`}
         </title>
         <link rel="stylesheet" href="/styles.css" />
+        {refreshSeconds && <script src="/refresh.js" defer />}
       </head>
       <body>
         <header class="site-header">
@@ -63,7 +60,13 @@ export function Layout({
             New trajectory
           </a>
         </header>
-        <main>{children}</main>
+        <main
+          {...(refreshSeconds
+            ? { "data-refresh-seconds": String(refreshSeconds) }
+            : {})}
+        >
+          {children}
+        </main>
         <footer>
           <a href="/about">About</a>
         </footer>

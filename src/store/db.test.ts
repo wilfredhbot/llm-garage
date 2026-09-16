@@ -6,6 +6,9 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { DataSource } from "typeorm";
 import { createAppDataSource } from "../db/data-source";
+import { RunEventEntity } from "../entities/run-event";
+import { TrajectoryEntity } from "../entities/trajectory";
+import { TurnEntity } from "../entities/turn";
 import { ModelAlreadyExistsError, RepoAlreadyExistsError } from "./errors";
 import { createStarterModels } from "./seed";
 import { DatabaseDataStore } from "./db";
@@ -39,7 +42,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
     owner: "example",
     name: "persistent-project",
     defaultBranch: "trunk",
-    autoMerge: false,
   });
   await dataSource.destroy();
 
@@ -51,7 +53,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
 
   assert.deepEqual(await store.getRepo(created.id), created);
   assert.equal((await store.listRepos()).length, 4);
-  assert.equal(await store.setRepoAutoMerge(created.id, true), true);
   await dataSource.destroy();
 
   dataSource = createAppDataSource(dataDir);
@@ -60,7 +61,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
   await store.initialize();
   await seedModels(store);
 
-  assert.equal((await store.getRepo(created.id))?.autoMerge, true);
   assert.equal(await store.deleteRepo(created.id), "deleted");
   await dataSource.destroy();
 
@@ -132,7 +132,6 @@ void test("persists model CRUD and keeps models used by trajectories", async (t)
     owner: "example",
     name: "model-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -169,14 +168,12 @@ void test("persists trajectories, turns, and ordered events across restarts", as
     owner: "example",
     name: "trajectory-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   await assert.rejects(
     store.createRepo({
       owner: repo.owner,
       name: repo.name,
       defaultBranch: "different",
-      autoMerge: false,
     }),
     RepoAlreadyExistsError,
   );
@@ -233,6 +230,88 @@ void test("persists trajectories, turns, and ordered events across restarts", as
   assert.equal(await restartedStore.deleteRepo(repo.id), "in_use");
 });
 
+void test("fails workers interrupted by an application restart", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-restart-"));
+  let dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+  const store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "interrupted-project",
+    defaultBranch: "main",
+  });
+  const startedAt = new Date("2026-09-14T23:02:42Z");
+  const trajectoryId = "interrupted-trajectory";
+  const turnId = "interrupted-turn";
+  await dataSource.getRepository(TrajectoryEntity).save({
+    id: trajectoryId,
+    parentId: null,
+    rootId: trajectoryId,
+    comparisonId: null,
+    repoId: repo.id,
+    title: "Interrupt the trajectory",
+    status: "running",
+    modelId: "openai/gpt-5.6-sol",
+    taskPrompt: "Wait for an application restart",
+    prUrl: null,
+    createdAt: startedAt,
+    updatedAt: startedAt,
+  });
+  await dataSource.getRepository(TurnEntity).save({
+    id: turnId,
+    trajectoryId,
+    kind: "initial",
+    prompt: "Wait for an application restart",
+    status: "running",
+    createdAt: startedAt,
+    finishedAt: null,
+  });
+  await dataSource.getRepository(RunEventEntity).save({
+    id: "interrupted-event",
+    trajectoryId,
+    turnId,
+    sequence: 1,
+    kind: "status",
+    data: "GPT-5.6 Sol started",
+    ts: startedAt,
+  });
+
+  await dataSource.destroy();
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  const restartedStore = new DatabaseDataStore(dataSource, { seed: false });
+  await restartedStore.initialize();
+
+  assert.equal(
+    (await restartedStore.getTrajectory(trajectoryId))?.status,
+    "failed",
+  );
+  const [turn] = await restartedStore.listTurns(trajectoryId);
+  assert.ok(turn);
+  assert.equal(turn.status, "failed");
+  assert.ok(turn.finishedAt);
+  assert.deepEqual(
+    (await restartedStore.listRunEvents(turn.id)).map(({ kind, data }) => ({
+      kind,
+      data,
+    })),
+    [
+      { kind: "status", data: "GPT-5.6 Sol started" },
+      {
+        kind: "system",
+        data: "Worker interrupted when LLM Garage restarted",
+      },
+      { kind: "status", data: "Trajectory failed" },
+    ],
+  );
+});
+
 void test("commits cancellation state and its event together", async (t) => {
   const dataDir = await mkdtemp(
     path.join(os.tmpdir(), "llm-garage-trajectory-cancel-"),
@@ -254,7 +333,6 @@ void test("commits cancellation state and its event together", async (t) => {
     owner: "example",
     name: "cancel-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -302,7 +380,6 @@ void test("sends persisted conversation history to each worker turn", async (t) 
     owner: "example",
     name: "conversation-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -351,7 +428,6 @@ void test("runs one trajectory per selected model in a comparison", async (t) =>
     owner: "example",
     name: "compare-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const modelIds = [
     "openai/gpt-5.6-sol",
@@ -417,7 +493,6 @@ void test("leaves a single-model trajectory out of any comparison", async (t) =>
     owner: "example",
     name: "single-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -470,13 +545,11 @@ void test("rejects invalid trajectory relationships without partial records", as
     owner: "example",
     name: "first-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const secondRepo = await store.createRepo({
     owner: "example",
     name: "second-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const parent = await createOne(store, {
     repoId: firstRepo.id,
@@ -525,7 +598,6 @@ void test("persists worker failures and their terminal events", async (t) => {
     owner: "example",
     name: "failure-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -598,7 +670,6 @@ void test("owns a sandbox for the full trajectory lifecycle", async (t) => {
     owner: "example",
     name: "sandbox-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -623,6 +694,43 @@ void test("owns a sandbox for the full trajectory lifecycle", async (t) => {
   ]);
   assert.equal(await store.archiveTrajectory(trajectory.id), true);
   assert.deepEqual(archived, [trajectory.id]);
+});
+
+void test("lets the worker name its trajectory", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-name-"));
+  const dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+  const store = new DatabaseDataStore(dataSource, {
+    seed: false,
+    worker: {
+      run: async (context) => {
+        assert.ok(context.setTrajectoryName);
+        await context.setTrajectoryName("Inspect command output");
+      },
+    },
+  });
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "naming-project",
+    defaultBranch: "main",
+  });
+  const trajectory = await createOne(store, {
+    repoId: repo.id,
+    title: "Initial generated title",
+    modelIds: ["openai/gpt-5.6-sol"],
+    taskPrompt: "Inspect the command output",
+  });
+
+  await waitForStatus(store, trajectory.id, "succeeded");
+  assert.equal(
+    (await store.getTrajectory(trajectory.id))?.title,
+    "Inspect command output",
+  );
 });
 
 void test("aggregates recorded usage into a spend report", async (t) => {
@@ -657,7 +765,6 @@ void test("aggregates recorded usage into a spend report", async (t) => {
     owner: "example",
     name: "spend-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectories = await store.createTrajectories({
     repoId: repo.id,
@@ -740,3 +847,37 @@ async function seedModels(store: DataStore): Promise<void> {
     if (!(await store.getModel(input.id))) await store.createModel(input);
   }
 }
+
+void test("persists settings across data source restarts", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-settings-"));
+  let dataSource: DataSource | undefined;
+
+  t.after(async () => {
+    if (dataSource?.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  let store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+  await store.setSetting("lastRepoId", "repo-parser");
+  await store.setSetting(
+    "lastModelIds",
+    JSON.stringify(["openai/gpt-5.6-sol"]),
+  );
+  await dataSource.destroy();
+
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+
+  assert.equal(await store.getSetting("lastRepoId"), "repo-parser");
+  assert.deepEqual(
+    JSON.parse((await store.getSetting("lastModelIds")) ?? "[]"),
+    ["openai/gpt-5.6-sol"],
+  );
+  assert.equal(await store.getSetting("missing"), undefined);
+  await dataSource.destroy();
+});

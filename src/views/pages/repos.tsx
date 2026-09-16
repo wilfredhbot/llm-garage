@@ -16,7 +16,7 @@ export function ReposPage({
 }) {
   const success = notice?.startsWith("Added") || notice?.startsWith("Deleted");
   return (
-    <Layout title="Repositories" section="repos">
+    <Layout title="Repositories" section="settings">
       <div class="page-header">
         <h1>Repositories</h1>
         <a class="button button-primary" href="/repos/new">
@@ -74,7 +74,7 @@ export function ReposPage({
 
 export function NewRepoPage({ error }: { error?: string }) {
   return (
-    <Layout title="Add repository" section="repos">
+    <Layout title="Add repository" section="settings">
       <div class="breadcrumb">
         <a href="/repos">Repositories</a>
         <span>/</span>
@@ -110,10 +110,6 @@ export function NewRepoPage({ error }: { error?: string }) {
             autocomplete="off"
           />
         </label>
-        <label class="checkbox">
-          <input type="checkbox" name="autoMerge" />
-          Auto-merge pull requests when required checks pass
-        </label>
         <button class="button button-primary" type="submit">
           Add repository
         </button>
@@ -134,7 +130,7 @@ export function RepoDetailPage({
   const activeCount = trajectories.filter(isActive).length;
   const trajectoriesUrl = `/trajectories?repoId=${encodeURIComponent(repo.id)}`;
   return (
-    <Layout title={`${repo.owner}/${repo.name}`} section="repos">
+    <Layout title={`${repo.owner}/${repo.name}`} section="settings">
       <div class="breadcrumb">
         <a href="/repos">Repositories</a>
         <span>/</span>
@@ -177,22 +173,6 @@ export function RepoDetailPage({
           <div class="stat-value">{activeCount}</div>
         </section>
       </div>
-      <section class="card repo-auto-merge">
-        <h2>Auto-merge</h2>
-        <form
-          class="auto-merge-form"
-          method="post"
-          action={`/repos/${repo.id}/auto-merge`}
-        >
-          <label class="checkbox">
-            <input type="checkbox" name="autoMerge" checked={repo.autoMerge} />
-            Merge pull requests automatically when required checks pass
-          </label>
-          <button class="button" type="submit">
-            Save
-          </button>
-        </form>
-      </section>
       <p class="muted small repo-created">
         Added{" "}
         <time dateTime={repo.createdAt.toISOString()}>

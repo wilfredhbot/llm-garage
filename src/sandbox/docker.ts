@@ -1,13 +1,26 @@
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
 import Docker from "dockerode";
-import type { CommandResult, Sandbox, SandboxRepository } from "./types";
+import type {
+  CommandResult,
+  ContainerManager,
+  ManagedContainer,
+  RemoveContainersOptions,
+  Sandbox,
+  SandboxRepository,
+} from "./types";
 
 const managedLabel = "com.llm-garage.managed";
 const trajectoryLabel = "com.llm-garage.trajectory-id";
 const repositoryLabel = "com.llm-garage.repository";
 const branchLabel = "com.llm-garage.default-branch";
-const defaultOutputLimit = 64 * 1024;
+const defaultOutputLimit = 16 * 1024;
+const truncationMarker = Buffer.from("\n... output truncated ...\n");
+const defaultWorkerImage = "ghcr.io/wilfred/llm-garage:worker";
+const workerUser = "agent";
+const workerUid = 10001;
+const workerHome = "/home/agent";
+const repositoryPath = `${workerHome}/repo`;
 
 export type DockerSandboxOptions = {
   docker?: Docker;
@@ -19,7 +32,7 @@ export type DockerSandboxOptions = {
   outputLimitBytes?: number;
 };
 
-export class DockerSandbox implements Sandbox {
+export class DockerSandbox implements Sandbox, ContainerManager {
   private readonly docker: Docker;
   private readonly image: string;
   private readonly githubToken: string | undefined;
@@ -32,9 +45,9 @@ export class DockerSandbox implements Sandbox {
 
   constructor({
     docker = new Docker(),
-    image = "node:22-bookworm",
+    image = defaultWorkerImage,
     githubToken,
-    memoryBytes = 512 * 1024 * 1024,
+    memoryBytes = 4 * 1024 * 1024 * 1024,
     nanoCpus = 1_000_000_000,
     pidsLimit = 128,
     outputLimitBytes = defaultOutputLimit,
@@ -84,11 +97,15 @@ export class DockerSandbox implements Sandbox {
 
     if (
       details?.State.Running &&
+      details.Config.Image === this.image &&
       matchesRepository(details.Config.Labels, repository) &&
-      matchesGithubToken(details.Config.Env, this.githubToken)
+      matchesGithubToken(details.Config.Env, this.githubToken) &&
+      allowsExec(details.HostConfig.Tmpfs)
     ) {
-      if (details.NetworkSettings.Networks["bridge"]) {
-        await this.disconnectNetwork(trajectoryId);
+      if (!details.NetworkSettings.Networks["bridge"]) {
+        await this.docker.getNetwork("bridge").connect({
+          Container: containerName(trajectoryId),
+        });
       }
       return;
     }
@@ -103,11 +120,13 @@ export class DockerSandbox implements Sandbox {
         "-c",
         "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
       ],
-      User: "65534:65534",
-      WorkingDir: "/workspace",
-      ...(this.githubToken
-        ? { Env: [`GITHUB_TOKEN=${this.githubToken}`] }
-        : {}),
+      User: workerUser,
+      WorkingDir: workerHome,
+      Env: [
+        `HOME=${workerHome}`,
+        "GH_PROMPT_DISABLED=1",
+        ...(this.githubToken ? [`GITHUB_TOKEN=${this.githubToken}`] : []),
+      ],
       Labels: {
         [managedLabel]: "true",
         [trajectoryLabel]: trajectoryId,
@@ -124,27 +143,18 @@ export class DockerSandbox implements Sandbox {
         ReadonlyRootfs: true,
         SecurityOpt: ["no-new-privileges:true"],
         Tmpfs: {
-          "/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777",
-          "/workspace":
-            "rw,nosuid,nodev,size=256m,uid=65534,gid=65534,mode=0750",
+          [workerHome]: `rw,nosuid,nodev,exec,size=10g,uid=${workerUid.toString()},gid=${workerUid.toString()},mode=0700`,
+          "/tmp": "rw,nosuid,nodev,exec,size=2g,mode=1777",
         },
       },
     });
     try {
       await container.start();
       await this.cloneRepository(container, repository);
-      await this.disconnectNetwork(trajectoryId);
     } catch (error) {
       await container.remove({ force: true, v: true }).catch(() => undefined);
       throw error;
     }
-  }
-
-  private async disconnectNetwork(trajectoryId: string): Promise<void> {
-    await this.docker.getNetwork("bridge").disconnect({
-      Container: containerName(trajectoryId),
-      Force: true,
-    });
   }
 
   private async cloneRepository(
@@ -160,13 +170,13 @@ export class DockerSandbox implements Sandbox {
         "--single-branch",
         "--",
         `https://github.com/${repository.owner}/${repository.name}.git`,
-        "/workspace",
+        repositoryPath,
       ],
       AttachStdout: true,
       AttachStderr: true,
       Tty: false,
-      User: "65534:65534",
-      WorkingDir: "/workspace",
+      User: workerUser,
+      WorkingDir: workerHome,
     });
     const stream = await execution.start({ hijack: true, stdin: false });
     const stdout = new PassThrough();
@@ -209,8 +219,8 @@ export class DockerSandbox implements Sandbox {
       AttachStdout: true,
       AttachStderr: true,
       Tty: false,
-      User: "65534:65534",
-      WorkingDir: "/workspace",
+      User: workerUser,
+      WorkingDir: repositoryPath,
     });
     const stream = await execution.start({ hijack: true, stdin: false });
     const stdout = new PassThrough();
@@ -260,6 +270,55 @@ export class DockerSandbox implements Sandbox {
     }
   }
 
+  async listContainers(): Promise<ManagedContainer[]> {
+    const containers = await this.listManagedContainers();
+    return containers.map((container) => {
+      const trajectoryId = container.Labels[trajectoryLabel];
+      const name = container.Names[0]?.replace(/^\/+/, "") ?? container.Id;
+      return {
+        id: container.Id,
+        name,
+        ...(trajectoryId === undefined ? {} : { trajectoryId }),
+        image: container.Image,
+        state: container.State,
+        status: container.Status,
+        createdAt: new Date(container.Created * 1000),
+      };
+    });
+  }
+
+  async removeContainers({
+    keepTrajectoryIds = new Set<string>(),
+  }: RemoveContainersOptions = {}): Promise<number> {
+    await Promise.allSettled(this.creates.values());
+    const containers = await this.listManagedContainers();
+    const candidates = containers.filter((container) => {
+      const trajectoryId = container.Labels[trajectoryLabel];
+      return trajectoryId === undefined || !keepTrajectoryIds.has(trajectoryId);
+    });
+    const removed = await Promise.all(
+      candidates.map(async (container) => {
+        try {
+          await this.docker
+            .getContainer(container.Id)
+            .remove({ force: true, v: true });
+          return 1;
+        } catch (error) {
+          if (isNotFound(error)) return 0;
+          throw error;
+        }
+      }),
+    );
+    return removed.reduce<number>((total, count) => total + count, 0);
+  }
+
+  private listManagedContainers(): Promise<Docker.ContainerInfo[]> {
+    return this.docker.listContainers({
+      all: true,
+      filters: { label: [`${managedLabel}=true`] },
+    });
+  }
+
   private async ensureImage(): Promise<void> {
     this.imagePromise ??= this.inspectOrPullImage().catch((error: unknown) => {
       this.imagePromise = undefined;
@@ -300,6 +359,14 @@ function matchesRepository(
   );
 }
 
+function allowsExec(
+  tmpfs: Record<string, string> | undefined,
+): boolean {
+  return Object.values(tmpfs ?? {}).every((options) =>
+    options.split(",").includes("exec"),
+  );
+}
+
 function matchesGithubToken(
   environment: string[] | undefined,
   githubToken: string | undefined,
@@ -324,17 +391,50 @@ function capture(
   limit: number,
 ): Promise<{ text: string; truncated: boolean }> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
+    const headChunks: Buffer[] = [];
+    const headLimit = Math.floor(
+      Math.max(0, limit - truncationMarker.length) / 2,
+    );
+    let headBytes = 0;
+    let tail = Buffer.alloc(0);
     let bytes = 0;
-    let truncated = false;
     stream.on("data", (chunk: Buffer) => {
-      const remaining = Math.max(0, limit - bytes);
-      if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
-      bytes += Math.min(chunk.length, remaining);
-      if (chunk.length > remaining) truncated = true;
+      bytes += chunk.length;
+      const headRemaining = Math.max(0, headLimit - headBytes);
+      if (headRemaining > 0) {
+        const captured = chunk.subarray(0, headRemaining);
+        headChunks.push(captured);
+        headBytes += captured.length;
+        chunk = chunk.subarray(captured.length);
+      }
+      if (chunk.length === 0) return;
+      tail = Buffer.concat([tail, chunk]);
+      const tailLimit = Math.max(0, limit - headBytes);
+      if (tail.length > tailLimit)
+        tail = tail.subarray(tail.length - tailLimit);
     });
     stream.on("end", () => {
-      resolve({ text: Buffer.concat(chunks).toString("utf8"), truncated });
+      const head = Buffer.concat(headChunks);
+      if (bytes <= limit) {
+        resolve({
+          text: Buffer.concat([head, tail]).toString("utf8"),
+          truncated: false,
+        });
+        return;
+      }
+      const marker = truncationMarker.subarray(
+        0,
+        Math.max(0, limit - head.length),
+      );
+      const tailLimit = Math.max(0, limit - head.length - marker.length);
+      resolve({
+        text: Buffer.concat([
+          head,
+          marker,
+          tail.subarray(Math.max(0, tail.length - tailLimit)),
+        ]).toString("utf8"),
+        truncated: true,
+      });
     });
     stream.on("error", reject);
   });

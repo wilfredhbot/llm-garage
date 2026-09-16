@@ -4,6 +4,7 @@ import type { DataSource, EntityManager, Repository } from "typeorm";
 import { ModelEntity } from "../entities/model";
 import { RepoEntity } from "../entities/repo";
 import { RunEventEntity } from "../entities/run-event";
+import { Setting } from "../entities/setting";
 import { TrajectoryEntity } from "../entities/trajectory";
 import { TurnEntity } from "../entities/turn";
 import { DisabledSandbox, type Sandbox } from "../sandbox/types";
@@ -47,6 +48,7 @@ export class DatabaseDataStore implements DataStore {
   private readonly trajectoryRepository: Repository<TrajectoryEntity>;
   private readonly turnRepository: Repository<TurnEntity>;
   private readonly eventRepository: Repository<RunEventEntity>;
+  private readonly settingRepository: Repository<Setting>;
   private readonly activeWorkers = new Map<string, AbortController>();
   // The better-sqlite3 driver holds a single connection, so overlapping
   // transactions from concurrent workers would nest and fail.
@@ -70,19 +72,31 @@ export class DatabaseDataStore implements DataStore {
     this.trajectoryRepository = dataSource.getRepository(TrajectoryEntity);
     this.turnRepository = dataSource.getRepository(TurnEntity);
     this.eventRepository = dataSource.getRepository(RunEventEntity);
+    this.settingRepository = dataSource.getRepository(Setting);
     this.worker = worker;
     this.sandbox = sandbox;
     this.seed = seed;
   }
 
   async initialize(): Promise<void> {
-    if (!this.seed) return;
-    if ((await this.repoRepository.count()) === 0) {
-      await this.repoRepository.save(createStarterRepos());
+    await this.failInterruptedWorkers();
+    if (this.seed) {
+      if ((await this.repoRepository.count()) === 0) {
+        await this.repoRepository.save(createStarterRepos());
+      }
+      if ((await this.modelRepository.count()) === 0) {
+        await this.modelRepository.save(createStarterModels());
+      }
     }
-    if ((await this.modelRepository.count()) === 0) {
-      await this.modelRepository.save(createStarterModels());
-    }
+  }
+
+  async getSetting(key: string): Promise<string | undefined> {
+    const setting = await this.settingRepository.findOneBy({ key });
+    return setting?.value;
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.settingRepository.save({ key, value });
   }
 
   async listModels(): Promise<Model[]> {
@@ -147,11 +161,6 @@ export class DatabaseDataStore implements DataStore {
         createdAt: new Date(),
       }),
     );
-  }
-
-  async setRepoAutoMerge(id: string, autoMerge: boolean): Promise<boolean> {
-    const result = await this.repoRepository.update({ id }, { autoMerge });
-    return result.affected !== 0;
   }
 
   async deleteRepo(id: string): Promise<DeleteRepoResult> {
@@ -454,6 +463,42 @@ export class DatabaseDataStore implements DataStore {
     void this.runWorker(trajectoryId, turnId, controller);
   }
 
+  private async failInterruptedWorkers(): Promise<void> {
+    await this.transaction(async (manager) => {
+      const trajectories = await manager.getRepository(TrajectoryEntity).find({
+        where: [{ status: "running" }, { status: "queued" }],
+      });
+      for (const trajectory of trajectories) {
+        const now = this.now();
+        trajectory.status = "failed";
+        trajectory.updatedAt = now;
+        await manager.getRepository(TrajectoryEntity).save(trajectory);
+
+        const turn = await this.activeTurn(manager, trajectory.id);
+        if (!turn) continue;
+        turn.status = "failed";
+        turn.finishedAt = now;
+        await manager.getRepository(TurnEntity).save(turn);
+        await this.appendEvent(
+          manager,
+          trajectory.id,
+          turn.id,
+          "system",
+          "Worker interrupted when LLM Garage restarted",
+          now,
+        );
+        await this.appendEvent(
+          manager,
+          trajectory.id,
+          turn.id,
+          "status",
+          "Trajectory failed",
+          now,
+        );
+      }
+    });
+  }
+
   private async runWorker(
     trajectoryId: string,
     turnId: string,
@@ -483,6 +528,8 @@ export class DatabaseDataStore implements DataStore {
           signal: controller.signal,
           runCommand: (command) =>
             this.sandbox.runCommand(trajectoryId, command, controller.signal),
+          setTrajectoryName: (name) =>
+            this.setTrajectoryName(trajectoryId, name),
           emit: (event) => {
             writes = writes.then(() =>
               this.recordWorkerEvent(trajectoryId, turnId, event),
@@ -581,6 +628,22 @@ export class DatabaseDataStore implements DataStore {
         event.data,
         now,
       );
+    });
+  }
+
+  private async setTrajectoryName(
+    trajectoryId: string,
+    name: string,
+  ): Promise<void> {
+    await this.transaction(async (manager) => {
+      const repository = manager.getRepository(TrajectoryEntity);
+      const trajectory = await repository.findOneBy({ id: trajectoryId });
+      if (trajectory?.status !== "running") {
+        throw new Error("Trajectory is not running");
+      }
+      trajectory.title = name;
+      trajectory.updatedAt = this.now();
+      await repository.save(trajectory);
     });
   }
 
