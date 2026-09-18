@@ -54,7 +54,15 @@ void test("sends a conversation to OpenRouter and emits its response", async () 
     (body as { model: string; messages: unknown[] }).model,
     "anthropic/claude-opus-5",
   );
-  assert.deepEqual((body as { messages: unknown[] }).messages, [
+  const messages = (
+    body as {
+      messages: Array<{ role: string; content: string }>;
+    }
+  ).messages;
+  assert.match(messages[0]?.content ?? "", /\/home\/agent\/repo/);
+  assert.doesNotMatch(messages[0]?.content ?? "", /\/workspace/);
+  assert.match(messages[0]?.content ?? "", /set_trajectory_name/);
+  assert.deepEqual(messages.slice(-3), [
     { role: "user", content: "First question" },
     { role: "assistant", content: "First answer" },
     { role: "user", content: "Follow-up question" },
@@ -62,13 +70,13 @@ void test("sends a conversation to OpenRouter and emits its response", async () 
   assert.equal(
     (body as { tools: Array<{ function: { name: string } }> }).tools[0]
       ?.function.name,
-    "run_command",
+    "set_trajectory_name",
   );
   assert.deepEqual(
     (body as { tools: Array<{ function: { name: string } }> }).tools.map(
       (tool) => tool.function.name,
     ),
-    ["run_command", "fetch_url", "search_web"],
+    ["set_trajectory_name", "run_command", "fetch_url", "search_web"],
   );
   assert.deepEqual((body as { reasoning: unknown }).reasoning, {
     effort: "medium",
@@ -82,6 +90,62 @@ void test("sends a conversation to OpenRouter and emits its response", async () 
       usage: { inputTokens: 1250, outputTokens: 42, costUsd: 0.0125 },
     },
   ]);
+});
+
+void test("sets the trajectory name when requested by the model", async () => {
+  const responses = [
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: "name-1",
+                type: "function",
+                function: {
+                  name: "set_trajectory_name",
+                  arguments: JSON.stringify({ name: "Improve search results" }),
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    { choices: [{ message: { content: "Named the trajectory." } }] },
+  ];
+  const requests: unknown[] = [];
+  const names: string[] = [];
+  const worker = new OpenRouterWorker({
+    apiKey: "test-key",
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(init?.body as string));
+      return Response.json(responses.shift());
+    },
+  });
+
+  await worker.run({
+    modelId: "openai/gpt-5.6-sol",
+    modelName: "GPT-5.6 Sol",
+    effort: "medium",
+    messages: [{ role: "user", content: "Improve the search page" }],
+    signal: new AbortController().signal,
+    setTrajectoryName: async (name) => {
+      names.push(name);
+    },
+    emit: () => undefined,
+  });
+
+  assert.deepEqual(names, ["Improve search results"]);
+  const followUp = requests[1] as {
+    messages: Array<{ role: string; tool_call_id?: string; content: string }>;
+  };
+  assert.deepEqual(followUp.messages.at(-1), {
+    role: "tool",
+    tool_call_id: "name-1",
+    content: JSON.stringify({ name: "Improve search results" }),
+  });
 });
 
 void test("fetches URLs and searches Brave when requested by the model", async () => {

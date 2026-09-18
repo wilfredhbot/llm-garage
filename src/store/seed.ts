@@ -6,7 +6,6 @@ const starterRepos: Array<Omit<Repo, "createdAt"> & { ageMinutes: number }> = [
     owner: "Wilfred",
     name: "llm-garage",
     defaultBranch: "main",
-    autoMerge: true,
     ageMinutes: 9_000,
   },
   {
@@ -14,7 +13,6 @@ const starterRepos: Array<Omit<Repo, "createdAt"> & { ageMinutes: number }> = [
     owner: "Wilfred",
     name: "tree-sitter-elisp",
     defaultBranch: "master",
-    autoMerge: false,
     ageMinutes: 8_000,
   },
   {
@@ -22,7 +20,6 @@ const starterRepos: Array<Omit<Repo, "createdAt"> & { ageMinutes: number }> = [
     owner: "Wilfred",
     name: "digital-garden",
     defaultBranch: "main",
-    autoMerge: false,
     ageMinutes: 7_000,
   },
 ];
@@ -31,25 +28,21 @@ const starterModels: Array<Omit<Model, "createdAt">> = [
   {
     id: "openai/gpt-5.6-sol",
     name: "GPT-5.6 Sol",
-    provider: "OpenAI",
     effort: "medium",
   },
   {
     id: "anthropic/claude-opus-5",
     name: "Claude Opus 5",
-    provider: "Anthropic",
     effort: "medium",
   },
   {
     id: "moonshotai/kimi-k3",
     name: "Kimi K3",
-    provider: "MoonshotAI",
     effort: "medium",
   },
   {
     id: "z-ai/glm-5.2",
     name: "GLM 5.2",
-    provider: "Z.ai",
     effort: "medium",
   },
 ];

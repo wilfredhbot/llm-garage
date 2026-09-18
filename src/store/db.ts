@@ -4,6 +4,7 @@ import type { DataSource, EntityManager, Repository } from "typeorm";
 import { ModelEntity } from "../entities/model";
 import { RepoEntity } from "../entities/repo";
 import { RunEventEntity } from "../entities/run-event";
+import { Setting } from "../entities/setting";
 import { TrajectoryEntity } from "../entities/trajectory";
 import { TurnEntity } from "../entities/turn";
 import { DisabledSandbox, type Sandbox } from "../sandbox/types";
@@ -39,6 +40,7 @@ export type DatabaseStoreOptions = {
   simulationStepMs?: number;
   worker?: TrajectoryWorker;
   sandbox?: Sandbox;
+  maxRunning?: number;
 };
 
 export class DatabaseDataStore implements DataStore {
@@ -47,13 +49,20 @@ export class DatabaseDataStore implements DataStore {
   private readonly trajectoryRepository: Repository<TrajectoryEntity>;
   private readonly turnRepository: Repository<TurnEntity>;
   private readonly eventRepository: Repository<RunEventEntity>;
+  private readonly settingRepository: Repository<Setting>;
   private readonly activeWorkers = new Map<string, AbortController>();
+  // Trajectories waiting for a worker slot, oldest first.
+  private readonly pendingWorkers: Array<{
+    trajectoryId: string;
+    turnId: string;
+  }> = [];
   // The better-sqlite3 driver holds a single connection, so overlapping
   // transactions from concurrent workers would nest and fail.
   private readonly writeLock = new Mutex();
   private readonly worker: TrajectoryWorker;
   private readonly sandbox: Sandbox;
   private readonly seed: boolean;
+  private readonly maxRunning: number;
   private lastTimestamp = 0;
 
   constructor(
@@ -63,6 +72,7 @@ export class DatabaseDataStore implements DataStore {
       simulationStepMs = 500,
       worker = new DummyWorker({ stepDelayMs: simulationStepMs }),
       sandbox = new DisabledSandbox(),
+      maxRunning = Number.POSITIVE_INFINITY,
     }: DatabaseStoreOptions = {},
   ) {
     this.modelRepository = dataSource.getRepository(ModelEntity);
@@ -70,19 +80,32 @@ export class DatabaseDataStore implements DataStore {
     this.trajectoryRepository = dataSource.getRepository(TrajectoryEntity);
     this.turnRepository = dataSource.getRepository(TurnEntity);
     this.eventRepository = dataSource.getRepository(RunEventEntity);
+    this.settingRepository = dataSource.getRepository(Setting);
     this.worker = worker;
     this.sandbox = sandbox;
     this.seed = seed;
+    this.maxRunning = maxRunning;
   }
 
   async initialize(): Promise<void> {
-    if (!this.seed) return;
-    if ((await this.repoRepository.count()) === 0) {
-      await this.repoRepository.save(createStarterRepos());
+    await this.recoverInterruptedWorkers();
+    if (this.seed) {
+      if ((await this.repoRepository.count()) === 0) {
+        await this.repoRepository.save(createStarterRepos());
+      }
+      if ((await this.modelRepository.count()) === 0) {
+        await this.modelRepository.save(createStarterModels());
+      }
     }
-    if ((await this.modelRepository.count()) === 0) {
-      await this.modelRepository.save(createStarterModels());
-    }
+  }
+
+  async getSetting(key: string): Promise<string | undefined> {
+    const setting = await this.settingRepository.findOneBy({ key });
+    return setting?.value;
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.settingRepository.save({ key, value });
   }
 
   async listModels(): Promise<Model[]> {
@@ -149,11 +172,6 @@ export class DatabaseDataStore implements DataStore {
     );
   }
 
-  async setRepoAutoMerge(id: string, autoMerge: boolean): Promise<boolean> {
-    const result = await this.repoRepository.update({ id }, { autoMerge });
-    return result.affected !== 0;
-  }
-
   async deleteRepo(id: string): Promise<DeleteRepoResult> {
     return this.transaction(async (manager) => {
       const repoRepository = manager.getRepository(RepoEntity);
@@ -214,7 +232,7 @@ export class DatabaseDataStore implements DataStore {
         const repo = repos.find(({ id }) => id === trajectory.repoId);
         return {
           id: trajectory.repoId,
-          label: repo ? `${repo.owner}/${repo.name}` : "Unknown repository",
+          label: repo?.name ?? "Unknown repository",
         };
       }),
       unpricedTurns,
@@ -267,7 +285,7 @@ export class DatabaseDataStore implements DataStore {
           comparisonId,
           repoId: input.repoId,
           title: input.title,
-          status: "running",
+          status: "queued",
           modelId,
           taskPrompt: input.taskPrompt,
           prUrl: null,
@@ -279,7 +297,7 @@ export class DatabaseDataStore implements DataStore {
           trajectoryId: trajectory.id,
           kind: parent ? "spawn" : "initial",
           prompt: input.taskPrompt,
-          status: "running",
+          status: "queued",
           createdAt: now,
           finishedAt: null,
         });
@@ -288,7 +306,7 @@ export class DatabaseDataStore implements DataStore {
           trajectory.id,
           turn.id,
           "status",
-          `${model.name} started`,
+          `${model.name} queued`,
           now,
         );
         started.push({ trajectory: toTrajectory(trajectory), turnId: turn.id });
@@ -350,11 +368,11 @@ export class DatabaseDataStore implements DataStore {
         trajectoryId,
         kind: "feedback",
         prompt: feedback,
-        status: "running",
+        status: "queued",
         createdAt: now,
         finishedAt: null,
       });
-      trajectory.status = "running";
+      trajectory.status = "queued";
       trajectory.updatedAt = now;
       await trajectoryRepository.save(trajectory);
       await this.appendEvent(
@@ -362,7 +380,7 @@ export class DatabaseDataStore implements DataStore {
         trajectory.id,
         created.id,
         "status",
-        `${model?.name ?? trajectory.modelId} started`,
+        `${model?.name ?? trajectory.modelId} queued`,
         now,
       );
       return toTurn(created);
@@ -449,9 +467,116 @@ export class DatabaseDataStore implements DataStore {
   }
 
   private startWorker(trajectoryId: string, turnId: string): void {
-    const controller = new AbortController();
-    this.activeWorkers.set(trajectoryId, controller);
-    void this.runWorker(trajectoryId, turnId, controller);
+    this.pendingWorkers.push({ trajectoryId, turnId });
+    this.drainPendingWorkers();
+  }
+
+  private drainPendingWorkers(): void {
+    while (this.activeWorkers.size < this.maxRunning) {
+      const next = this.pendingWorkers.shift();
+      if (!next) return;
+
+      const controller = new AbortController();
+      this.activeWorkers.set(next.trajectoryId, controller);
+      void this.runWorker(next.trajectoryId, next.turnId, controller).finally(
+        () => {
+          this.drainPendingWorkers();
+        },
+      );
+    }
+  }
+
+  // Promotes a queued turn to running once it has a worker slot. Returns false
+  // when the trajectory was cancelled or archived while it waited.
+  private async beginTurn(
+    trajectoryId: string,
+    turnId: string,
+  ): Promise<boolean> {
+    return this.transaction(async (manager) => {
+      const trajectoryRepository = manager.getRepository(TrajectoryEntity);
+      const turnRepository = manager.getRepository(TurnEntity);
+      const trajectory = await trajectoryRepository.findOneBy({
+        id: trajectoryId,
+      });
+      const turn = await turnRepository.findOneBy({ id: turnId });
+      if (trajectory?.status !== "queued" || turn?.status !== "queued") {
+        return false;
+      }
+
+      const model = await manager
+        .getRepository(ModelEntity)
+        .findOneBy({ id: trajectory.modelId });
+      const now = this.now();
+      trajectory.status = "running";
+      trajectory.updatedAt = now;
+      turn.status = "running";
+      await trajectoryRepository.save(trajectory);
+      await turnRepository.save(turn);
+      await this.appendEvent(
+        manager,
+        trajectoryId,
+        turnId,
+        "status",
+        `${model?.name ?? trajectory.modelId} started`,
+        now,
+      );
+      return true;
+    });
+  }
+
+  // A queued trajectory never started, so it is re-queued on startup. A running
+  // one lost its in-memory conversation with the worker, so it cannot continue.
+  private async recoverInterruptedWorkers(): Promise<void> {
+    const requeued = await this.transaction(async (manager) => {
+      const trajectoryRepository = manager.getRepository(TrajectoryEntity);
+      const pending: Array<{ trajectoryId: string; turnId: string }> = [];
+
+      const queued = await trajectoryRepository.find({
+        where: { status: "queued" },
+        order: { createdAt: "ASC" },
+      });
+      for (const trajectory of queued) {
+        const turn = await this.activeTurn(manager, trajectory.id);
+        if (turn)
+          pending.push({ trajectoryId: trajectory.id, turnId: turn.id });
+      }
+
+      const running = await trajectoryRepository.find({
+        where: { status: "running" },
+      });
+      for (const trajectory of running) {
+        const now = this.now();
+        trajectory.status = "failed";
+        trajectory.updatedAt = now;
+        await trajectoryRepository.save(trajectory);
+
+        const turn = await this.activeTurn(manager, trajectory.id);
+        if (!turn) continue;
+        turn.status = "failed";
+        turn.finishedAt = now;
+        await manager.getRepository(TurnEntity).save(turn);
+        await this.appendEvent(
+          manager,
+          trajectory.id,
+          turn.id,
+          "system",
+          "Worker interrupted when LLM Garage restarted",
+          now,
+        );
+        await this.appendEvent(
+          manager,
+          trajectory.id,
+          turn.id,
+          "status",
+          "Trajectory failed",
+          now,
+        );
+      }
+      return pending;
+    });
+
+    for (const { trajectoryId, turnId } of requeued)
+      this.startWorker(trajectoryId, turnId);
   }
 
   private async runWorker(
@@ -461,6 +586,7 @@ export class DatabaseDataStore implements DataStore {
   ): Promise<void> {
     let writes = Promise.resolve();
     try {
+      if (!(await this.beginTurn(trajectoryId, turnId))) return;
       const trajectory = await this.getTrajectory(trajectoryId);
       if (!trajectory) return;
       const model = await this.getModel(trajectory.modelId);
@@ -483,6 +609,8 @@ export class DatabaseDataStore implements DataStore {
           signal: controller.signal,
           runCommand: (command) =>
             this.sandbox.runCommand(trajectoryId, command, controller.signal),
+          setTrajectoryName: (name) =>
+            this.setTrajectoryName(trajectoryId, name),
           emit: (event) => {
             writes = writes.then(() =>
               this.recordWorkerEvent(trajectoryId, turnId, event),
@@ -581,6 +709,22 @@ export class DatabaseDataStore implements DataStore {
         event.data,
         now,
       );
+    });
+  }
+
+  private async setTrajectoryName(
+    trajectoryId: string,
+    name: string,
+  ): Promise<void> {
+    await this.transaction(async (manager) => {
+      const repository = manager.getRepository(TrajectoryEntity);
+      const trajectory = await repository.findOneBy({ id: trajectoryId });
+      if (trajectory?.status !== "running") {
+        throw new Error("Trajectory is not running");
+      }
+      trajectory.title = name;
+      trajectory.updatedAt = this.now();
+      await repository.save(trajectory);
     });
   }
 
@@ -712,6 +856,10 @@ export class DatabaseDataStore implements DataStore {
   }
 
   private stopWorker(trajectoryId: string): void {
+    const pending = this.pendingWorkers.findIndex(
+      (worker) => worker.trajectoryId === trajectoryId,
+    );
+    if (pending !== -1) this.pendingWorkers.splice(pending, 1);
     this.activeWorkers.get(trajectoryId)?.abort();
     this.activeWorkers.delete(trajectoryId);
   }

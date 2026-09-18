@@ -5,7 +5,6 @@ export type Model = {
   // The OpenRouter model slug, such as "anthropic/claude-opus-5".
   id: string;
   name: string;
-  provider: string;
   effort: ModelEffort;
   createdAt: Date;
 };
@@ -15,7 +14,6 @@ export type Repo = {
   owner: string;
   name: string;
   defaultBranch: string;
-  autoMerge: boolean;
   createdAt: Date;
 };
 
@@ -87,19 +85,13 @@ export type RunEvent = {
   ts: Date;
 };
 
-export type CreateModelInput = Pick<
-  Model,
-  "id" | "name" | "provider" | "effort"
->;
+export type CreateModelInput = Pick<Model, "id" | "name" | "effort">;
 
-export type UpdateModelInput = Pick<Model, "name" | "provider" | "effort">;
+export type UpdateModelInput = Pick<Model, "name" | "effort">;
 
 export type DeleteModelResult = "deleted" | "in_use" | "not_found";
 
-export type CreateRepoInput = Pick<
-  Repo,
-  "owner" | "name" | "defaultBranch" | "autoMerge"
->;
+export type CreateRepoInput = Pick<Repo, "owner" | "name" | "defaultBranch">;
 
 export type CreateTrajectoriesInput = {
   repoId: string;
@@ -126,6 +118,9 @@ export type SpendReport = SpendTotals & {
 };
 
 export interface DataStore {
+  getSetting(key: string): Promise<string | undefined>;
+  setSetting(key: string, value: string): Promise<void>;
+
   listModels(): Promise<Model[]>;
   getModel(id: string): Promise<Model | undefined>;
   createModel(input: CreateModelInput): Promise<Model>;
@@ -135,7 +130,6 @@ export interface DataStore {
   listRepos(): Promise<Repo[]>;
   getRepo(id: string): Promise<Repo | undefined>;
   createRepo(input: CreateRepoInput): Promise<Repo>;
-  setRepoAutoMerge(id: string, autoMerge: boolean): Promise<boolean>;
   deleteRepo(id: string): Promise<DeleteRepoResult>;
 
   listTrajectories(): Promise<Trajectory[]>;

@@ -17,8 +17,11 @@ export function ModelsPage({
   notice?: string;
 }) {
   const success = notice?.startsWith("Added") || notice?.startsWith("Deleted");
+  const sortedModels = [...models].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+  );
   return (
-    <Layout title="Models" section="models">
+    <Layout title="Models" section="settings">
       <div class="page-header">
         <h1>Models</h1>
         <a class="button button-primary" href="/models/new">
@@ -39,13 +42,12 @@ export function ModelsPage({
             <thead>
               <tr>
                 <th>Model</th>
-                <th>Provider</th>
                 <th>Effort</th>
                 <th>Trajectories</th>
               </tr>
             </thead>
             <tbody>
-              {models.map((model) => (
+              {sortedModels.map((model) => (
                 <tr>
                   <td>
                     <a
@@ -56,7 +58,6 @@ export function ModelsPage({
                     </a>
                     <div class="muted small">{model.id}</div>
                   </td>
-                  <td>{model.provider}</td>
                   <td>{model.effort}</td>
                   <td>
                     {
@@ -79,11 +80,11 @@ export function NewModelPage({
   values,
   error,
 }: {
-  values?: { id: string; name: string; provider: string; effort: string };
+  values?: { id: string; name: string; effort: string };
   error?: string;
 }) {
   return (
-    <Layout title="Add model" section="models">
+    <Layout title="Add model" section="settings">
       <div class="breadcrumb">
         <a href="/models">Models</a>
         <span>/</span>
@@ -108,14 +109,6 @@ export function NewModelPage({
           value={values?.name ?? ""}
           autocomplete="off"
         />
-        <input
-          name="provider"
-          required
-          aria-label="Provider"
-          placeholder="Anthropic"
-          value={values?.provider ?? ""}
-          autocomplete="off"
-        />
         <EffortSelect selected={values?.effort} />
         <button class="button button-primary" type="submit">
           Add model
@@ -136,7 +129,7 @@ export function ModelDetailPage({
 }) {
   const path = `/models/${encodeURIComponent(model.id)}`;
   return (
-    <Layout title={model.name} section="models">
+    <Layout title={model.name} section="settings">
       <div class="breadcrumb">
         <a href="/models">Models</a>
         <span>/</span>
@@ -157,10 +150,6 @@ export function ModelDetailPage({
           <div class="stat-value">{model.id}</div>
         </section>
         <section class="card">
-          <h2>Provider</h2>
-          <div class="stat-value">{model.provider}</div>
-        </section>
-        <section class="card">
           <h2>Trajectories</h2>
           <div class="stat-value">{trajectories.length}</div>
         </section>
@@ -172,13 +161,6 @@ export function ModelDetailPage({
           required
           aria-label="Display name"
           value={model.name}
-          autocomplete="off"
-        />
-        <input
-          name="provider"
-          required
-          aria-label="Provider"
-          value={model.provider}
           autocomplete="off"
         />
         <EffortSelect selected={model.effort} />

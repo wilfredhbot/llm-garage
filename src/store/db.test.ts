@@ -6,6 +6,9 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { DataSource } from "typeorm";
 import { createAppDataSource } from "../db/data-source";
+import { RunEventEntity } from "../entities/run-event";
+import { TrajectoryEntity } from "../entities/trajectory";
+import { TurnEntity } from "../entities/turn";
 import { ModelAlreadyExistsError, RepoAlreadyExistsError } from "./errors";
 import { createStarterModels } from "./seed";
 import { DatabaseDataStore } from "./db";
@@ -39,7 +42,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
     owner: "example",
     name: "persistent-project",
     defaultBranch: "trunk",
-    autoMerge: false,
   });
   await dataSource.destroy();
 
@@ -51,7 +53,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
 
   assert.deepEqual(await store.getRepo(created.id), created);
   assert.equal((await store.listRepos()).length, 4);
-  assert.equal(await store.setRepoAutoMerge(created.id, true), true);
   await dataSource.destroy();
 
   dataSource = createAppDataSource(dataDir);
@@ -60,7 +61,6 @@ void test("persists repository CRUD across data source restarts", async (t) => {
   await store.initialize();
   await seedModels(store);
 
-  assert.equal((await store.getRepo(created.id))?.autoMerge, true);
   assert.equal(await store.deleteRepo(created.id), "deleted");
   await dataSource.destroy();
 
@@ -89,14 +89,12 @@ void test("persists model CRUD and keeps models used by trajectories", async (t)
   const created = await store.createModel({
     id: "deepseek/deepseek-r2",
     name: "DeepSeek R2",
-    provider: "DeepSeek",
     effort: "high",
   });
   await assert.rejects(
     store.createModel({
       id: created.id,
       name: "Duplicate",
-      provider: "DeepSeek",
       effort: "low",
     }),
     ModelAlreadyExistsError,
@@ -111,7 +109,6 @@ void test("persists model CRUD and keeps models used by trajectories", async (t)
   assert.deepEqual(await store.getModel(created.id), created);
   const updated = await store.updateModel(created.id, {
     name: "DeepSeek R2 Turbo",
-    provider: "DeepSeek",
     effort: "low",
   });
   assert.ok(updated);
@@ -121,7 +118,6 @@ void test("persists model CRUD and keeps models used by trajectories", async (t)
   assert.equal(
     await store.updateModel("nobody/nothing", {
       name: "Nothing",
-      provider: "Nobody",
       effort: "low",
     }),
     undefined,
@@ -132,7 +128,6 @@ void test("persists model CRUD and keeps models used by trajectories", async (t)
     owner: "example",
     name: "model-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -169,14 +164,12 @@ void test("persists trajectories, turns, and ordered events across restarts", as
     owner: "example",
     name: "trajectory-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   await assert.rejects(
     store.createRepo({
       owner: repo.owner,
       name: repo.name,
       defaultBranch: "different",
-      autoMerge: false,
     }),
     RepoAlreadyExistsError,
   );
@@ -233,6 +226,88 @@ void test("persists trajectories, turns, and ordered events across restarts", as
   assert.equal(await restartedStore.deleteRepo(repo.id), "in_use");
 });
 
+void test("fails workers interrupted by an application restart", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-restart-"));
+  let dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+  const store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "interrupted-project",
+    defaultBranch: "main",
+  });
+  const startedAt = new Date("2026-09-14T23:02:42Z");
+  const trajectoryId = "interrupted-trajectory";
+  const turnId = "interrupted-turn";
+  await dataSource.getRepository(TrajectoryEntity).save({
+    id: trajectoryId,
+    parentId: null,
+    rootId: trajectoryId,
+    comparisonId: null,
+    repoId: repo.id,
+    title: "Interrupt the trajectory",
+    status: "running",
+    modelId: "openai/gpt-5.6-sol",
+    taskPrompt: "Wait for an application restart",
+    prUrl: null,
+    createdAt: startedAt,
+    updatedAt: startedAt,
+  });
+  await dataSource.getRepository(TurnEntity).save({
+    id: turnId,
+    trajectoryId,
+    kind: "initial",
+    prompt: "Wait for an application restart",
+    status: "running",
+    createdAt: startedAt,
+    finishedAt: null,
+  });
+  await dataSource.getRepository(RunEventEntity).save({
+    id: "interrupted-event",
+    trajectoryId,
+    turnId,
+    sequence: 1,
+    kind: "status",
+    data: "GPT-5.6 Sol started",
+    ts: startedAt,
+  });
+
+  await dataSource.destroy();
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  const restartedStore = new DatabaseDataStore(dataSource, { seed: false });
+  await restartedStore.initialize();
+
+  assert.equal(
+    (await restartedStore.getTrajectory(trajectoryId))?.status,
+    "failed",
+  );
+  const [turn] = await restartedStore.listTurns(trajectoryId);
+  assert.ok(turn);
+  assert.equal(turn.status, "failed");
+  assert.ok(turn.finishedAt);
+  assert.deepEqual(
+    (await restartedStore.listRunEvents(turn.id)).map(({ kind, data }) => ({
+      kind,
+      data,
+    })),
+    [
+      { kind: "status", data: "GPT-5.6 Sol started" },
+      {
+        kind: "system",
+        data: "Worker interrupted when LLM Garage restarted",
+      },
+      { kind: "status", data: "Trajectory failed" },
+    ],
+  );
+});
+
 void test("commits cancellation state and its event together", async (t) => {
   const dataDir = await mkdtemp(
     path.join(os.tmpdir(), "llm-garage-trajectory-cancel-"),
@@ -254,7 +329,6 @@ void test("commits cancellation state and its event together", async (t) => {
     owner: "example",
     name: "cancel-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -270,7 +344,11 @@ void test("commits cancellation state and its event together", async (t) => {
   assert.ok(turn);
   assert.deepEqual(
     (await store.listRunEvents(turn.id)).map(({ data }) => data),
-    ["GPT-5.6 Sol started", "Trajectory cancelled by user"],
+    [
+      "GPT-5.6 Sol queued",
+      "GPT-5.6 Sol started",
+      "Trajectory cancelled by user",
+    ],
   );
 });
 
@@ -302,7 +380,6 @@ void test("sends persisted conversation history to each worker turn", async (t) 
     owner: "example",
     name: "conversation-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -351,7 +428,6 @@ void test("runs one trajectory per selected model in a comparison", async (t) =>
     owner: "example",
     name: "compare-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const modelIds = [
     "openai/gpt-5.6-sol",
@@ -417,7 +493,6 @@ void test("leaves a single-model trajectory out of any comparison", async (t) =>
     owner: "example",
     name: "single-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -470,13 +545,11 @@ void test("rejects invalid trajectory relationships without partial records", as
     owner: "example",
     name: "first-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const secondRepo = await store.createRepo({
     owner: "example",
     name: "second-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const parent = await createOne(store, {
     repoId: firstRepo.id,
@@ -525,7 +598,6 @@ void test("persists worker failures and their terminal events", async (t) => {
     owner: "example",
     name: "failure-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -545,8 +617,9 @@ void test("persists worker failures and their terminal events", async (t) => {
     })),
     [
       { kind: "status", sequence: 1 },
-      { kind: "system", sequence: 2 },
-      { kind: "status", sequence: 3 },
+      { kind: "status", sequence: 2 },
+      { kind: "system", sequence: 3 },
+      { kind: "status", sequence: 4 },
     ],
   );
 });
@@ -598,7 +671,6 @@ void test("owns a sandbox for the full trajectory lifecycle", async (t) => {
     owner: "example",
     name: "sandbox-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectory = await createOne(store, {
     repoId: repo.id,
@@ -623,6 +695,43 @@ void test("owns a sandbox for the full trajectory lifecycle", async (t) => {
   ]);
   assert.equal(await store.archiveTrajectory(trajectory.id), true);
   assert.deepEqual(archived, [trajectory.id]);
+});
+
+void test("lets the worker name its trajectory", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-name-"));
+  const dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+  const store = new DatabaseDataStore(dataSource, {
+    seed: false,
+    worker: {
+      run: async (context) => {
+        assert.ok(context.setTrajectoryName);
+        await context.setTrajectoryName("Inspect command output");
+      },
+    },
+  });
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "naming-project",
+    defaultBranch: "main",
+  });
+  const trajectory = await createOne(store, {
+    repoId: repo.id,
+    title: "Initial generated title",
+    modelIds: ["openai/gpt-5.6-sol"],
+    taskPrompt: "Inspect the command output",
+  });
+
+  await waitForStatus(store, trajectory.id, "succeeded");
+  assert.equal(
+    (await store.getTrajectory(trajectory.id))?.title,
+    "Inspect command output",
+  );
 });
 
 void test("aggregates recorded usage into a spend report", async (t) => {
@@ -657,7 +766,6 @@ void test("aggregates recorded usage into a spend report", async (t) => {
     owner: "example",
     name: "spend-project",
     defaultBranch: "main",
-    autoMerge: false,
   });
   const trajectories = await store.createTrajectories({
     repoId: repo.id,
@@ -698,7 +806,7 @@ void test("aggregates recorded usage into a spend report", async (t) => {
   assert.deepEqual(spend.byRepo, [
     {
       id: repo.id,
-      label: "example/spend-project",
+      label: "spend-project",
       trajectories: 2,
       usage: { inputTokens: 300, outputTokens: 30, costUsd: 0.25 },
     },
@@ -740,3 +848,200 @@ async function seedModels(store: DataStore): Promise<void> {
     if (!(await store.getModel(input.id))) await store.createModel(input);
   }
 }
+
+void test("persists settings across data source restarts", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-settings-"));
+  let dataSource: DataSource | undefined;
+
+  t.after(async () => {
+    if (dataSource?.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  let store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+  await store.setSetting("lastRepoId", "repo-parser");
+  await store.setSetting(
+    "lastModelIds",
+    JSON.stringify(["openai/gpt-5.6-sol"]),
+  );
+  await dataSource.destroy();
+
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  store = new DatabaseDataStore(dataSource, { seed: false });
+  await store.initialize();
+
+  assert.equal(await store.getSetting("lastRepoId"), "repo-parser");
+  assert.deepEqual(
+    JSON.parse((await store.getSetting("lastModelIds")) ?? "[]"),
+    ["openai/gpt-5.6-sol"],
+  );
+  assert.equal(await store.getSetting("missing"), undefined);
+  await dataSource.destroy();
+});
+
+void test("runs at most the configured number of trajectories at once", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-cap-"));
+  const dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+
+  const started: string[] = [];
+  const release = new Map<string, () => void>();
+  const modelIds = [
+    "openai/gpt-5.6-sol",
+    "anthropic/claude-opus-5",
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.2",
+  ];
+  const store = new DatabaseDataStore(dataSource, {
+    seed: false,
+    maxRunning: 2,
+    worker: {
+      run: async (context) => {
+        started.push(context.modelId);
+        await new Promise<void>((resolve) =>
+          release.set(context.modelId, resolve),
+        );
+      },
+    },
+  });
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "capped-project",
+    defaultBranch: "main",
+  });
+
+  const trajectories = await store.createTrajectories({
+    repoId: repo.id,
+    title: "Capped comparison",
+    modelIds,
+    taskPrompt: "Exercise the worker cap",
+  });
+  assert.equal(trajectories.length, 4);
+  for (const trajectory of trajectories)
+    assert.equal(trajectory.status, "queued");
+
+  await waitForStatus(store, trajectories[0]?.id ?? "", "running");
+  await waitForStatus(store, trajectories[1]?.id ?? "", "running");
+  await delay(50);
+  assert.deepEqual(started, modelIds.slice(0, 2));
+  for (const trajectory of trajectories.slice(2)) {
+    assert.equal((await store.getTrajectory(trajectory.id))?.status, "queued");
+  }
+
+  // Each freed slot admits the trajectory that has waited longest.
+  release.get(modelIds[0] ?? "")?.();
+  await waitForStatus(store, trajectories[2]?.id ?? "", "running");
+  await delay(50);
+  assert.deepEqual(started, modelIds.slice(0, 3));
+  assert.equal(
+    (await store.getTrajectory(trajectories[3]?.id ?? ""))?.status,
+    "queued",
+  );
+
+  release.get(modelIds[1] ?? "")?.();
+  await waitForStatus(store, trajectories[3]?.id ?? "", "running");
+  assert.deepEqual(started, modelIds);
+  for (const resolve of release.values()) resolve();
+});
+
+void test("re-queues trajectories that were still waiting at restart", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-requeue-"));
+  let dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+
+  const blocked = new DatabaseDataStore(dataSource, {
+    seed: false,
+    maxRunning: 1,
+    worker: { run: () => new Promise<void>(() => undefined) },
+  });
+  await seedModels(blocked);
+  const repo = await blocked.createRepo({
+    owner: "example",
+    name: "requeue-project",
+    defaultBranch: "main",
+  });
+  const [running, waiting] = await blocked.createTrajectories({
+    repoId: repo.id,
+    title: "Restart while queued",
+    modelIds: ["openai/gpt-5.6-sol", "anthropic/claude-opus-5"],
+    taskPrompt: "Exercise restart recovery",
+  });
+  assert.ok(running && waiting);
+  await waitForStatus(blocked, running.id, "running");
+  assert.equal((await blocked.getTrajectory(waiting.id))?.status, "queued");
+
+  await dataSource.destroy();
+  dataSource = createAppDataSource(dataDir);
+  await dataSource.initialize();
+  const restarted = new DatabaseDataStore(dataSource, {
+    seed: false,
+    worker: { run: async () => undefined },
+  });
+  await restarted.initialize();
+
+  // The interrupted trajectory cannot continue, but the queued one never
+  // started and so runs to completion.
+  assert.equal((await restarted.getTrajectory(running.id))?.status, "failed");
+  await waitForStatus(restarted, waiting.id, "succeeded");
+});
+
+void test("drops a queued trajectory from the queue when it is cancelled", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "llm-garage-unqueue-"));
+  const dataSource = createAppDataSource(dataDir);
+  t.after(async () => {
+    if (dataSource.isInitialized) await dataSource.destroy();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  await dataSource.initialize();
+
+  let runs = 0;
+  let unblock = (): void => undefined;
+  const store = new DatabaseDataStore(dataSource, {
+    seed: false,
+    maxRunning: 1,
+    worker: {
+      run: async () => {
+        runs += 1;
+        await new Promise<void>((resolve) => {
+          unblock = resolve;
+        });
+      },
+    },
+  });
+  await seedModels(store);
+  const repo = await store.createRepo({
+    owner: "example",
+    name: "unqueue-project",
+    defaultBranch: "main",
+  });
+  const [running, waiting] = await store.createTrajectories({
+    repoId: repo.id,
+    title: "Cancel while queued",
+    modelIds: ["openai/gpt-5.6-sol", "anthropic/claude-opus-5"],
+    taskPrompt: "Exercise cancelling a queued trajectory",
+  });
+  assert.ok(running && waiting);
+  await waitForStatus(store, running.id, "running");
+
+  assert.equal(await store.cancelTrajectory(waiting.id), true);
+  assert.equal((await store.getTrajectory(waiting.id))?.status, "cancelled");
+
+  unblock();
+  await waitForStatus(store, running.id, "succeeded");
+  await delay(50);
+  assert.equal(runs, 1);
+  assert.equal((await store.getTrajectory(waiting.id))?.status, "cancelled");
+});
